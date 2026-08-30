@@ -1,0 +1,30 @@
+{
+  "name": "NetWatch",
+  "version": "1.0.0",
+  "scrapers": [
+    {
+      "id": "rogmovies",
+      "name": "RogMovies",
+      "description": "Bollywood movies and shows from RogMovies",
+      "version": "1.0.0",
+      "author": "NetWatch",
+      "supportedTypes": ["movie", "tv"],
+      "filename": "providers/rogmovies.js",
+      "enabled": true,
+      "hasSettings": true,
+      "formats": ["mp4", "mkv"]
+    },
+    {
+      "id": "4khdhub",
+      "name": "4KHDHub",
+      "description": "4K, 1080p, and HDR movies and series from 4KHDHub with DirectResolver fastpath",
+      "version": "1.0.0",
+      "author": "NetWatch",
+      "supportedTypes": ["movie", "tv"],
+      "filename": "providers/4khdhub.js",
+      "enabled": true,
+      "hasSettings": true,
+      "formats": ["mp4", "mkv"]
+    }
+  ]
+}
