@@ -297,17 +297,27 @@ function extractQualityGroups(html) {
 
 // ── Fetch nexdrive page → extract vcloud for episode ─────────────────────────
 
+function findVcloudLink(text) {
+    if (!text) return null;
+    var matches = text.match(/https?:\/\/(?:[a-z0-9.-]*vcloud|[a-z0-9.-]*v-cloud|[a-z0-9.-]*fastdl)\.[a-z0-9.-]+\/([a-z0-9][a-z0-9_-]{5,})/gi);
+    if (!matches) return null;
+    for (var i = 0; i < matches.length; i++) {
+        var u = matches[i];
+        if (u.indexOf("/embed") === -1 && u.indexOf("/player") === -1) {
+            return u;
+        }
+    }
+    return null;
+}
+
 function fetchNexdrivePage(nexdriveUrl, type, season, episode) {
     return fetchText(nexdriveUrl).then(function(html) {
-        // For movies: just grab first vcloud link
+        // For movies: just grab first valid vcloud link
         if (type !== "tv") {
-            var m = html.match(/https?:\/\/vcloud\.\w+\/([a-z0-9][a-z0-9-]{6,})/i);
-            return m ? m[0] : null;
+            return findVcloudLink(html);
         }
 
         // For TV: find vcloud link for the specific episode
-        // Structure: "-:Episodes: N:-" heading then vcloud href
-        // We look for V-Cloud [Resumable] button for the right episode
         var targetEp = parseInt(episode, 10) || 1;
 
         // Split by episode headings
@@ -315,25 +325,24 @@ function fetchNexdrivePage(nexdriveUrl, type, season, episode) {
 
         for (var i = 1; i < epSections.length; i++) {
             var sec = epSections[i];
-            // Check if this section starts with our episode number (e.g. "01" or "1")
             var epMatch = sec.match(/^(\d+)/);
             if (!epMatch) continue;
             if (parseInt(epMatch[1], 10) !== targetEp) continue;
 
             // Found the right episode section — get the vcloud link
-            var vcMatch = sec.match(/href=["'](https?:\/\/vcloud\.\w+\/[a-z0-9][a-z0-9-]{6,})["']/i);
-            if (vcMatch) {
-                console.log("[nexdrive] ep" + targetEp + " vcloud=" + vcMatch[1]);
-                return vcMatch[1];
+            var vcLink = findVcloudLink(sec);
+            if (vcLink) {
+                console.log("[nexdrive] ep" + targetEp + " vcloud=" + vcLink);
+                return vcLink;
             }
         }
 
         // Fallback only if requesting episode 1
         if (targetEp === 1) {
-            var firstVc = html.match(/https?:\/\/vcloud\.\w+\/([a-z0-9][a-z0-9-]{6,})/i);
+            var firstVc = findVcloudLink(html);
             if (firstVc) {
                 console.log("[nexdrive] fallback first vcloud for ep1");
-                return firstVc[0];
+                return firstVc;
             }
         }
 
