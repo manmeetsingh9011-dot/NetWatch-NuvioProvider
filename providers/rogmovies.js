@@ -221,14 +221,19 @@ function processPostPage(html, type, season, episode, showTitle) {
             return resolveVCloud(p, isTv, showTitle, season, episode, settings).catch(function() { return null; });
         });
 
-        return Promise.all(resolves).then(function(streams) {
+        return Promise.all(resolves).then(function(streamGroups) {
             var out = [];
             var seen = {};
-            for (var i = 0; i < streams.length; i++) {
-                var s = streams[i];
-                if (s && s.url && !seen[s.url]) {
-                    seen[s.url] = true;
-                    out.push(s);
+            for (var i = 0; i < streamGroups.length; i++) {
+                var grp = streamGroups[i];
+                if (!grp) continue;
+                var list = Array.isArray(grp) ? grp : [grp];
+                for (var j = 0; j < list.length; j++) {
+                    var s = list[j];
+                    if (s && s.url && !seen[s.url]) {
+                        seen[s.url] = true;
+                        out.push(s);
+                    }
                 }
             }
 
@@ -357,6 +362,70 @@ function fetchNexdrivePage(nexdriveUrl, type, season, episode) {
 
 // ── VCloud resolver ───────────────────────────────────────────────────────────
 
+function checkGoFileAlive(id) {
+    if (!id) return Promise.resolve(false);
+    var url = "https://gofilecdn.eu.cc/" + id;
+    var controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+    var timer = null;
+    if (controller) {
+        timer = setTimeout(function() { controller.abort(); }, 1500);
+    }
+    return fetch(url, {
+        method: "GET",
+        headers: { "Range": "bytes=0-10", "User-Agent": UA },
+        signal: controller ? controller.signal : undefined,
+        redirect: "manual"
+    })
+    .then(function(r) {
+        if (timer) clearTimeout(timer);
+        return r.status >= 200 && r.status < 400;
+    })
+    .catch(function() {
+        if (timer) clearTimeout(timer);
+        return false;
+    });
+}
+
+function extractAllCdnCandidates(html) {
+    var candidates = [];
+    var seen = {};
+
+    function add(cdnType, url, extra) {
+        if (!url || seen[url]) return;
+        seen[url] = true;
+        candidates.push({ type: cdnType, url: url, extra: extra });
+    }
+
+    // 1. R2
+    var r2 = html.match(/href=["'](https:\/\/pub-[a-f0-9]+\.r2\.dev\/[^"']+)["']/i);
+    if (r2) add("R2", r2[1]);
+
+    // 2. FSL S3 presigned URL
+    var s3 = html.match(/href=["'](https:\/\/[a-f0-9]+\.r2\.cloudflarestorage\.com\/[^"']+)["']/i);
+    if (s3) add("S3", s3[1]);
+
+    // 3. Android Intent
+    var intent = html.match(/createIntentURL\s*\(\s*\{host:\s*['"]([^'"]+)['"]/i);
+    if (intent && intent[1].indexOf("http") === 0) add("Intent", stripToken(intent[1]));
+
+    // 4. PixelDrain -> convert /u/ to /api/file/
+    var pxl = html.match(/var pxl\s*=\s*["'](https?:\/\/pixeldrain[^"']+)["']/i) ||
+              html.match(/href=["'](https?:\/\/pixeldrain\.[a-z0-9.-]+\/u\/[A-Za-z0-9_-]+)["']/i);
+    if (pxl) add("PixelDrain", pxl[1].replace("/u/", "/api/file/"));
+
+    // 5. GoFile -> fast CDN conversion with liveness check
+    var gf = html.match(/href=["'](https?:\/\/gofile\.io\/d\/([A-Za-z0-9]+))["']/i);
+    if (gf) add("GoFile", "https://gofilecdn.eu.cc/" + gf[2], { gofileId: gf[2] });
+
+    // 6. Workers CDN
+    var w = html.match(/href=["'](https?:\/\/[a-z0-9.-]+\.workers\.dev\/[^"']+)["']/i);
+    if (w) add("Workers", w[1]);
+
+    return candidates;
+}
+
+// ── VCloud resolver ───────────────────────────────────────────────────────────
+
 function resolveVCloud(page, isTv, showTitle, season, episode, settings) {
     var vcloudUrl = page.vcloudUrl;
     console.log("[vcloud] " + vcloudUrl);
@@ -367,7 +436,7 @@ function resolveVCloud(page, isTv, showTitle, season, episode, settings) {
         var m = html.match(/atob\((?:atob\()?['"]([^'"]+)['"]\)?\)/i);
         if (!m) {
             console.log("[vcloud] no atob len=" + html.length);
-            return null;
+            return [];
         }
 
         var tokenUrl;
@@ -376,53 +445,47 @@ function resolveVCloud(page, isTv, showTitle, season, episode, settings) {
             tokenUrl = (step1.indexOf("http") === 0) ? step1 : atob(step1);
         } catch(e) {
             console.log("[vcloud] decode error: " + e.message);
-            return null;
+            return [];
         }
-        if (!tokenUrl || tokenUrl.indexOf("http") !== 0) return null;
+        if (!tokenUrl || tokenUrl.indexOf("http") !== 0) return [];
         console.log("[vcloud] token=" + tokenUrl.substring(0, 60));
 
         return fetchText(tokenUrl, { "Referer": vcloudUrl })
         .then(function(html2) {
-            return Promise.resolve(extractCdnFromTokenPage(html2))
-            .then(function(cdnUrl) {
-                if (!cdnUrl) return null;
-                return makeStream(page, cdnUrl, isTv, showTitle, season, episode, settings);
+            var candidates = extractAllCdnCandidates(html2);
+            if (!candidates.length) return [];
+
+            var checks = candidates.map(function(c) {
+                if (c.type === "GoFile") {
+                    return checkGoFileAlive(c.extra.gofileId).then(function(isAlive) {
+                        if (isAlive) {
+                            console.log("[cdn] GoFile (Active)");
+                            return c.url;
+                        }
+                        console.log("[cdn] GoFile dead/removed — skipped");
+                        return null;
+                    });
+                }
+                console.log("[cdn] " + c.type);
+                return Promise.resolve(c.url);
+            });
+
+            return Promise.all(checks).then(function(checkedUrls) {
+                var validUrls = checkedUrls.filter(function(u) { return Boolean(u); });
+                // Pick at least up to 2 distinct CDN mirrors per quality group
+                var selected = validUrls.slice(0, 2);
+                if (!selected.length) return [];
+
+                var streams = [];
+                for (var i = 0; i < selected.length; i++) {
+                    var st = makeStream(page, selected[i], isTv, showTitle, season, episode, settings);
+                    if (st) streams.push(st);
+                }
+                return streams;
             });
         });
     })
-    .catch(function(e) { console.log("[vcloud] error: " + e.message); return null; });
-}
-
-function extractCdnFromTokenPage(html) {
-    return Promise.resolve(extractCdnFallbacks(html));
-}
-
-function extractCdnFallbacks(html) {
-    // Priority 1: GoFile → fast CDN conversion
-    var gf = html.match(/href=["'](https?:\/\/gofile\.io\/d\/([A-Za-z0-9]+))["']/);
-    if (gf) { console.log("[cdn] GoFile"); return "https://gofilecdn.eu.cc/" + gf[2]; }
-
-    // Priority 2: R2
-    var r2 = html.match(/href=["'](https:\/\/pub-[a-f0-9]+\.r2\.dev\/[^"']+)["']/);
-    if (r2) { console.log("[cdn] R2"); return r2[1]; }
-
-    // Priority 3: Android intent R2/FSL
-    var intent = html.match(/createIntentURL\s*\(\s*\{host:\s*['"]([^'"]+)['"]/);
-    if (intent && intent[1].indexOf("http") === 0) { console.log("[cdn] intent"); return stripToken(intent[1]); }
-
-    // Priority 4: PixelDrain → convert /u/ to /api/file/
-    var pxl = html.match(/var pxl\s*=\s*["'](https?:\/\/pixeldrain[^"']+)["']/);
-    if (pxl) {
-        console.log("[cdn] PixelDrain");
-        return pxl[1].replace("/u/", "/api/file/");
-    }
-
-    // Priority 5: FSL S3 presigned URL
-    var s3 = html.match(/href=["'](https:\/\/[a-f0-9]+\.r2\.cloudflarestorage\.com\/[^"']+)["']/);
-    if (s3) { console.log("[cdn] FSLv2/S3"); return s3[1]; }
-
-    console.log("[cdn] no CDN found");
-    return null;
+    .catch(function(e) { console.log("[vcloud] error: " + e.message); return []; });
 }
 
 // ── Pick best search hit ──────────────────────────────────────────────────────

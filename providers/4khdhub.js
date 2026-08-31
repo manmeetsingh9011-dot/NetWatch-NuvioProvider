@@ -285,21 +285,32 @@ function processPostPage(html, postUrl, type, season, episode, showTitle) {
 
     var resolves = downloadLinks.map(function(item) {
         return resolveDirect(item.url, postUrl)
-        .then(function(directUrl) {
-            if (!directUrl) return null;
-            return makeStream(item, directUrl, isTv, showTitle, season, episode, settings);
+        .then(function(res) {
+            if (!res) return [];
+            var urls = Array.isArray(res) ? res : [res];
+            var list = [];
+            for (var i = 0; i < urls.length; i++) {
+                var st = makeStream(item, urls[i], isTv, showTitle, season, episode, settings);
+                if (st) list.push(st);
+            }
+            return list;
         })
-        .catch(function() { return null; });
+        .catch(function() { return []; });
     });
 
-    return Promise.all(resolves).then(function(streams) {
+    return Promise.all(resolves).then(function(streamGroups) {
         var out = [];
         var seen = {};
-        for (var i = 0; i < streams.length; i++) {
-            var s = streams[i];
-            if (s && s.url && !seen[s.url]) {
-                seen[s.url] = true;
-                out.push(s);
+        for (var i = 0; i < streamGroups.length; i++) {
+            var grp = streamGroups[i];
+            if (!grp) continue;
+            var list = Array.isArray(grp) ? grp : [grp];
+            for (var j = 0; j < list.length; j++) {
+                var s = list[j];
+                if (s && s.url && !seen[s.url]) {
+                    seen[s.url] = true;
+                    out.push(s);
+                }
             }
         }
 
@@ -426,9 +437,9 @@ function resolveDirect(url, referer) {
         return resolveHubCdn(url);
     }
     if (isDirectCdn(url)) {
-        return Promise.resolve(stripToken(url));
+        return Promise.resolve([stripToken(url)]);
     }
-    return Promise.resolve(null);
+    return Promise.resolve([]);
 }
 
 // —— HubCloud Resolver with MD5 Title Fastpath & L0/L1 Caching —————————————————
@@ -438,18 +449,20 @@ function resolveHubCloud(startUrl) {
     var driveId = driveMatch ? driveMatch[1] : "";
 
     if (driveId && cdnCache[driveId]) {
-        console.log("[4khdhub-resolver] L0 cache hit: " + cdnCache[driveId].substring(0, 60));
-        return Promise.resolve(cdnCache[driveId]);
+        var cached = cdnCache[driveId];
+        var cachedList = Array.isArray(cached) ? cached : [cached];
+        console.log("[4khdhub-resolver] L0 cache hit (" + cachedList.length + " streams)");
+        return Promise.resolve(cachedList);
     }
 
     return fetchText(startUrl, { "Referer": BASE_URL + "/" })
     .then(function(html) {
         // Check if CDN link is already directly present on the HubCloud page
-        var directCheck = extractCdnFromBridgePage(html);
-        if (directCheck) {
-            var cleanDirect = stripToken(directCheck);
-            if (driveId) cdnCache[driveId] = cleanDirect;
-            return cleanDirect;
+        var directList = extractAllCdnsFromBridgePage(html);
+        if (directList.length) {
+            var selectedDirect = directList.slice(0, 2);
+            if (driveId) cdnCache[driveId] = selectedDirect;
+            return selectedDirect;
         }
 
         // Extract filename from <title>
@@ -462,13 +475,13 @@ function resolveHubCloud(startUrl) {
             var cachedBridgeUrl = gxUrlCache[driveId];
             return fetchText(cachedBridgeUrl, { "Referer": startUrl })
             .then(function(html2) {
-                var cdnUrl = extractCdnFromBridgePage(html2);
-                if (cdnUrl) {
-                    var clean = stripToken(cdnUrl);
-                    if (driveId) cdnCache[driveId] = clean;
-                    return clean;
+                var cdnList = extractAllCdnsFromBridgePage(html2);
+                if (cdnList.length) {
+                    var selected = cdnList.slice(0, 2);
+                    if (driveId) cdnCache[driveId] = selected;
+                    return selected;
                 }
-                return null;
+                return [];
             });
         }
 
@@ -522,67 +535,82 @@ function resolveHubCloud(startUrl) {
 
             return fetchText(bridgeUrl, { "Referer": startUrl })
             .then(function(html2) {
-                var cdnUrl = extractCdnFromBridgePage(html2);
-                if (cdnUrl) {
-                    var clean = stripToken(cdnUrl);
-                    if (driveId) cdnCache[driveId] = clean;
-                    return clean;
+                var cdnList = extractAllCdnsFromBridgePage(html2);
+                if (cdnList.length) {
+                    var selected = cdnList.slice(0, 2);
+                    if (driveId) cdnCache[driveId] = selected;
+                    return selected;
                 }
-                // Check if bridge page has a secondary redirect
-                return extractFirstCdnUrl(html2);
+                var first = extractFirstCdnUrl(html2);
+                return first ? [first] : [];
             });
         }
 
-        return null;
+        return [];
     })
     .catch(function(e) {
         console.log("[4khdhub-resolver] HubCloud error: " + e.message);
-        return null;
+        return [];
     });
 }
 
 // —— Bridge Page CDN Extractor (Buzz + R2 + Workers.dev + PixelDrain + S3) ────
 
-function extractCdnFromBridgePage(html) {
-    if (!html || typeof html !== "string") return null;
+function extractAllCdnsFromBridgePage(html) {
+    if (!html || typeof html !== "string") return [];
+    var list = [];
+    var seen = {};
+
+    function add(u) {
+        if (!u) return;
+        var clean = stripToken(u.replace(/&amp;/g, "&"));
+        if (!clean || clean.indexOf(".zip") !== -1 || seen[clean]) return;
+        seen[clean] = true;
+        list.push(clean);
+    }
 
     // Priority 1: #fsl element href
     var fslMatch = html.match(/<a[^>]+id=["']fsl["'][^>]+href=["']([^"']+)["']/i) ||
                    html.match(/href=["']([^"']+)["'][^>]+id=["']fsl["']/i);
-    if (fslMatch && fslMatch[1].indexOf(".zip") === -1) {
-        return fslMatch[1].replace(/&amp;/g, "&");
-    }
+    if (fslMatch) add(fslMatch[1]);
 
     // Priority 2: Direct scan for all recognized high-speed CDN hosts
     var cdnPatterns = [
-        /https?:\/\/[a-z0-9.-]*auvps\.buzz\/[^\s"'<>]+/i,
-        /https?:\/\/[a-z0-9.-]*homelander\.buzz\/[^\s"'<>]+/i,
-        /https?:\/\/[a-z0-9.-]*obsession\.buzz\/[^\s"'<>]+/i,
-        /https?:\/\/[a-z0-9.-]*mandalorian\.buzz\/[^\s"'<>]+/i,
-        /https?:\/\/[a-z0-9.-]*noirspy\.buzz\/[^\s"'<>]+/i,
-        /https?:\/\/[a-z0-9.-]+\.buzz\/[^\s"'<>]+/i,
-        /https?:\/\/[a-z0-9.-]+\.r2\.dev\/[^\s"'<>]+/i,
-        /https?:\/\/[a-z0-9.-]+\.r2\.cloudflarestorage\.com\/[^\s"'<>]+/i,
-        /https?:\/\/cloudserver[^\s"'<>]+\.workers\.dev\/[^\s"'<>]+/i,
-        /https?:\/\/[a-z0-9.-]+\.workers\.dev\/[^\s"'<>]+/i,
-        /https?:\/\/fsl-buckets\.life\/[^\s"'<>]+/i
+        /https?:\/\/[a-z0-9.-]*auvps\.buzz\/[^\s"'<>]+/gi,
+        /https?:\/\/[a-z0-9.-]*homelander\.buzz\/[^\s"'<>]+/gi,
+        /https?:\/\/[a-z0-9.-]*obsession\.buzz\/[^\s"'<>]+/gi,
+        /https?:\/\/[a-z0-9.-]*mandalorian\.buzz\/[^\s"'<>]+/gi,
+        /https?:\/\/[a-z0-9.-]*noirspy\.buzz\/[^\s"'<>]+/gi,
+        /https?:\/\/[a-z0-9.-]+\.buzz\/[^\s"'<>]+/gi,
+        /https?:\/\/[a-z0-9.-]+\.r2\.dev\/[^\s"'<>]+/gi,
+        /https?:\/\/[a-z0-9.-]+\.r2\.cloudflarestorage\.com\/[^\s"'<>]+/gi,
+        /https?:\/\/cloudserver[^\s"'<>]+\.workers\.dev\/[^\s"'<>]+/gi,
+        /https?:\/\/[a-z0-9.-]+\.workers\.dev\/[^\s"'<>]+/gi,
+        /https?:\/\/fsl-buckets\.life\/[^\s"'<>]+/gi
     ];
 
     for (var i = 0; i < cdnPatterns.length; i++) {
-        var m = html.match(cdnPatterns[i]);
-        if (m && m[0].indexOf(".zip") === -1) {
-            return m[0].replace(/&amp;/g, "&");
+        var matches = html.match(cdnPatterns[i]);
+        if (matches) {
+            for (var j = 0; j < matches.length; j++) {
+                add(matches[j]);
+            }
         }
     }
 
     // Priority 3: PixelDrain (Convert /u/ -> /api/file/)
-    var pxlMatch = html.match(/var\s+pxl\s*=\s*["']https:\/\/pixeldrain\.[a-z0-9.-]+\/u\/([A-Za-z0-9_\\-]+)["']/i) ||
-                   html.match(/href=["']https:\/\/pixeldrain\.[a-z0-9.-]+\/u\/([A-Za-z0-9_\\-]+)["']/i);
+    var pxlMatch = html.match(/var\s+pxl\s*=\s*["']https:\/\/pixeldrain\.[a-z0-9.-]+\/u\/([A-Za-z0-9_-]+)["']/i) ||
+                   html.match(/href=["']https:\/\/pixeldrain\.[a-z0-9.-]+\/u\/([A-Za-z0-9_-]+)["']/i);
     if (pxlMatch && pxlMatch[1]) {
-        return "https://pixeldrain.com/api/file/" + pxlMatch[1];
+        add("https://pixeldrain.com/api/file/" + pxlMatch[1]);
     }
 
-    return null;
+    return list;
+}
+
+function extractCdnFromBridgePage(html) {
+    var all = extractAllCdnsFromBridgePage(html);
+    return all.length ? all[0] : null;
 }
 
 // —— HubDrive Resolver (Extracts HubCloud link across any TLD) ─────────────────
@@ -596,11 +624,11 @@ function resolveHubDrive(hubdriveUrl) {
         if (hcMatch && hcMatch[1]) {
             return resolveHubCloud(hcMatch[1].replace(/&amp;/g, "&"));
         }
-        return null;
+        return [];
     })
     .catch(function(e) {
         console.log("[4khdhub-resolver] HubDrive error: " + e.message);
-        return null;
+        return [];
     });
 }
 
@@ -615,7 +643,7 @@ function resolveHubCdn(hubcdnUrl) {
                 var decoded = atob(reurlMatch[1]);
                 if (decoded.indexOf("hubcloud") !== -1) return resolveHubCloud(decoded);
                 if (decoded.indexOf("hubdrive") !== -1) return resolveHubDrive(decoded);
-                if (isDirectCdn(decoded)) return stripToken(decoded);
+                if (isDirectCdn(decoded)) return [stripToken(decoded)];
             } catch(e) {}
         }
         var nextMatch = html.match(/href=["'](https?:\/\/[^"']*(?:hubcloud|hubdrive)\.[a-z0-9.-]+\/[^"']+)["']/i);
@@ -624,9 +652,9 @@ function resolveHubCdn(hubcdnUrl) {
             if (nextUrl.indexOf("hubcloud") !== -1) return resolveHubCloud(nextUrl);
             if (nextUrl.indexOf("hubdrive") !== -1) return resolveHubDrive(nextUrl);
         }
-        return null;
+        return [];
     })
-    .catch(function() { return null; });
+    .catch(function() { return []; });
 }
 
 function isDirectCdn(url) {
