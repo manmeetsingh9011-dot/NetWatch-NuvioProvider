@@ -13,10 +13,29 @@
 var BASE_URL = "https://4khdhub.one";
 var UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36";
 
+function b64decode(str) {
+    if (typeof atob === "function") {
+        try { return atob(str); } catch(e) {}
+    }
+    var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+    var output = "";
+    str = String(str || "").replace(/=+$/, "");
+    for (var bc = 0, bs, buffer, idx = 0; buffer = str.charAt(idx++); ~buffer && (bs = bc % 4 ? bs * 64 + buffer : buffer, bc++ % 4) ? output += String.fromCharCode(255 & bs >> (-2 * bc & 6)) : 0) {
+        buffer = chars.indexOf(buffer);
+    }
+    return output;
+}
+
 function getTmdbKey() {
     try {
-        if (typeof globalThis !== "undefined" && globalThis.TMDB_KEY) return globalThis.TMDB_KEY;
-        if (typeof window !== "undefined" && window.TMDB_KEY) return window.TMDB_KEY;
+        if (typeof globalThis !== "undefined") {
+            if (globalThis.TMDB_API_KEY) return globalThis.TMDB_API_KEY;
+            if (globalThis.TMDB_KEY) return globalThis.TMDB_KEY;
+        }
+        if (typeof window !== "undefined") {
+            if (window.TMDB_API_KEY) return window.TMDB_API_KEY;
+            if (window.TMDB_KEY) return window.TMDB_KEY;
+        }
         var s = null;
         if (typeof globalThis !== "undefined") s = globalThis.SCRAPER_SETTINGS || globalThis.SETTINGS;
         if (!s && typeof window !== "undefined") s = window.SCRAPER_SETTINGS || window.SETTINGS;
@@ -29,7 +48,7 @@ function getTmdbKey() {
         "ZjE1YWFmOWNmMDVmMTRlY2UzMDliNjhjYWQwMWNlMjU=",
         "NDM5YzQ3OGE3NzFmMzVjMDUwMjJmOWZlYWJjY2EwMWM="
     ];
-    return atob(pool[Math.floor(Math.random() * pool.length)]);
+    return b64decode(pool[Math.floor(Math.random() * pool.length)]);
 }
 
 // ── Multi-Tier In-Memory Caches ───────────────────────────────────────────────
@@ -84,7 +103,9 @@ function resolveSettings(customSettings) {
                 sortBy = "size";
             }
         }
-    } catch (e) {}
+    } catch (e) {
+        console.error("[4khdhub] resolveSettings error: " + e.message);
+    }
     return { sortBy: sortBy };
 }
 
@@ -105,14 +126,24 @@ function getInvertedSortTag(score, maxScore) {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 function getStreams(tmdbId, mediaType, season, episode) {
-    var type = (mediaType === "tv" || mediaType === "series") ? "tv" : "movie";
-    var ep   = episode || 1;
-    var sea  = season  || 1;
-    console.log("[4khdhub] " + type + " tmdb=" + tmdbId + (type === "tv" ? " S" + sea + "E" + ep : ""));
+    var rawId = tmdbId;
+    if (typeof tmdbId === "object" && tmdbId !== null) {
+        rawId = tmdbId.tmdbId || tmdbId.id || tmdbId.imdbId || tmdbId.imdb_id || tmdbId;
+    }
+    var cleanId = String(rawId || "").replace(/^(?:tmdb|imdb):/i, "").trim();
 
-    var tmdbEndpoint = type === "tv" ? "tv" : "movie";
+    var type = (mediaType === "tv" || mediaType === "series") ? "tv" : "movie";
+    var ep   = parseInt(episode, 10) || 1;
+    var sea  = parseInt(season, 10)  || 1;
+    console.log("[4khdhub] " + type + " id=" + cleanId + (type === "tv" ? " S" + sea + "E" + ep : ""));
+
     var tmdbKey = getTmdbKey();
-    var tmdbPath = "/3/" + tmdbEndpoint + "/" + tmdbId + "?api_key=" + tmdbKey;
+    var isImdb = cleanId.indexOf("tt") === 0;
+    var tmdbEndpoint = type === "tv" ? "tv" : "movie";
+    var tmdbPath = isImdb
+        ? "/3/find/" + cleanId + "?api_key=" + tmdbKey + "&external_source=imdb_id"
+        : "/3/" + tmdbEndpoint + "/" + cleanId + "?api_key=" + tmdbKey;
+
     var tmdbHosts = ["https://api.themoviedb.org", "https://api.tmdb.org"];
 
     function tryTmdb(idx) {
@@ -127,8 +158,14 @@ function getStreams(tmdbId, mediaType, season, episode) {
             return r.json();
         })
         .then(function(data) {
-            var title = data.title || data.name || "";
-            var rawDate = data.release_date || data.first_air_date || "";
+            var item = data;
+            if (isImdb) {
+                var results = type === "tv" ? (data.tv_results || []) : (data.movie_results || []);
+                if (!results.length) results = (data.movie_results || []).concat(data.tv_results || []);
+                item = results[0] || {};
+            }
+            var title = item.title || item.name || "";
+            var rawDate = item.release_date || item.first_air_date || "";
             var year  = rawDate ? rawDate.substring(0, 4) : "";
             if (!title) { console.log("[4khdhub] TMDB no title"); return []; }
             console.log("[4khdhub] " + title + " (" + year + ")");
